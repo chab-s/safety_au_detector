@@ -1,0 +1,8 @@
+*/created_dataset/
+checkpoints/
+data_files/archive_datasets/
+data_files/images/
+face_datasets/
+model/
+*.keras
+
