@@ -5,4 +5,5 @@ data_files/images/
 face_datasets/
 model/
 *.keras
+*.npy
 
