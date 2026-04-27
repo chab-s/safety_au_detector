@@ -15,25 +15,64 @@ from lib.training import (TrainingHistory, save_checkpoint, load_latest_checkpoi
                            print_step, print_epoch, plot_history)
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 0. config
+# ═════════════════════════════════════════════════════════════════════════════
+
+# @dataclasses
+# class Level:
+#     name: str
+#     kernel_size: tuple
+#     strides: int
+#     type: str
+
+
+CONFIG_BB = [
+    ((5, 5), 'same'),
+    ((1, 1), (1, 1)),
+    (2, 'same')
+]
+
+CONFIG_DBB = [
+    (2, 'same'),
+    ((5, 5), 'same'),
+    ((5, 5), (1, 1), 'same'),
+    ((1, 1), (1, 1))
+]
+
+CONFIG_BACKBONE = [
+    ("s", 24, 1),
+    ("s", 24, 1),
+    ("s", 48, 2),
+    ("s", 48, 1),
+    ("s", 48, 1),
+
+    ("d", 96, 2),
+    ("d", 96, 1),
+    ("d", 96, 1),
+    ("d", 96, 2),
+    ("d", 96, 1),
+    ("d", 96, 1),
+]
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 1. BASE BLOCKS
 # ═════════════════════════════════════════════════════════════════════════════
 
 class BlazeBlock(tf.keras.layers.Layer):
-    def __init__(self, filters, strides=1, use_pool=True, **kwargs):
+    def __init__(self, filters, strides=1, use_skip=True, **kwargs):
         super(BlazeBlock, self).__init__(**kwargs)
-        self.strides = strides
-        self.filters = filters
-        self.use_pool = use_pool
+        self.use_skip = use_skip
 
-        if use_pool:
+        self.conv = tf.keras.Sequential([
+            layers.DepthwiseConv2D((5, 5), strides=strides, padding='same'),
+            layers.BatchNormalization(),
+            layers.Conv2D(filters, (1, 1), strides=(1, 1)),
+            layers.BatchNormalization()
+        ])
+
+        if self.use_skip:
             self.skip = layers.MaxPool2D(pool_size=2, strides=strides, padding='same')
             self.channel_pad = layers.Lambda(lambda x: self._pad_channels(x, filters))
-
-        self.dw_conv = layers.DepthwiseConv2D((5, 5), strides=strides, padding='same')
-        self.conv = layers.Conv2D(filters, (1, 1), strides=(1, 1))
-
-        self.norm_1 = layers.BatchNormalization()
-        self.norm_2 = layers.BatchNormalization()
 
         self.activation = layers.ReLU()
 
@@ -50,45 +89,39 @@ class BlazeBlock(tf.keras.layers.Layer):
         return tf.pad(x, paddings, mode='CONSTANT', constant_values=0)
 
     def call(self, inputs, training=False):
-        x = self.dw_conv(inputs)
-        x = self.norm_1(x)
-        x = self.conv(x)
-        x = self.norm_2(x)
+        y = self.conv(inputs, training=training)
 
-        if self.use_pool:
+        if self.use_skip:
             skip = self.skip(inputs)
             skip = self.channel_pad(skip)
-            x = x + skip
+            y = y + skip
 
-        x = self.activation(x)
-        return x
+        return self.activation(y)
 
 
 class DoubleBlazeBlock(tf.keras.layers.Layer):
     def __init__(self, filters, strides, use_pool=True, **kwargs):
         super(DoubleBlazeBlock, self).__init__(**kwargs)
 
-        self.filters = filters
-        self.strides = strides
         self.use_pool = use_pool
 
         if use_pool:
             self.skip = layers.MaxPool2D(pool_size=2, strides=strides, padding='same')
             self.channel_pad = layers.Lambda(lambda x: self._pad_channels(x, filters))
 
-        self.dw_conv_1 = layers.DepthwiseConv2D((5, 5), strides=strides, padding='same')
-        self.dw_conv_2 = layers.DepthwiseConv2D((5, 5), strides=(1, 1), padding='same')
+        self.activation_relu = layers.ReLU()
 
-        self.conv_project = layers.Conv2D(self.filters, (1, 1), strides=(1, 1))
-        self.conv_expand = layers.Conv2D(self.filters, (1, 1), strides=(1, 1))
-
-        self.norm_1 = layers.BatchNormalization()
-        self.norm_2 = layers.BatchNormalization()
-        self.norm_3 = layers.BatchNormalization()
-        self.norm_4 = layers.BatchNormalization()
-
-        self.activation_1 = layers.ReLU()
-        self.activation_2 = layers.ReLU()
+        self.conv = tf.keras.Sequential([
+            layers.DepthwiseConv2D((5, 5), strides=strides, padding='same'),
+            layers.BatchNormalization(),
+            layers.Conv2D(filters, (1, 1), strides=(1, 1)),
+            layers.BatchNormalization(),
+            self.activation_relu,
+            layers.DepthwiseConv2D((5, 5), strides=(1, 1), padding='same'),
+            layers.BatchNormalization(),
+            layers.Conv2D(filters, (1, 1), strides=(1, 1)),
+            layers.BatchNormalization()
+        ])
 
     def _pad_channels(self, x, target_channels):
         current_channels = x.shape[-1]
@@ -103,26 +136,16 @@ class DoubleBlazeBlock(tf.keras.layers.Layer):
         return tf.pad(x, paddings, mode='CONSTANT', constant_values=0)
 
     def call(self, inputs, training=False):
-        x = self.dw_conv_1(inputs)
-        x = self.norm_1(x)
-        x = self.conv_project(x)
-        x = self.norm_2(x)
-
-        x = self.activation_1(x)
-
-        x = self.dw_conv_2(x)
-        x = self.norm_3(x)
-        x = self.conv_expand(x)
-        x = self.norm_4(x)
+        y = self.conv(inputs, training=training)
 
         if self.use_pool:
             skip = self.skip(inputs)
             skip = self.channel_pad(skip)
-            x = x + skip
+            y = y + skip
 
-        x = self.activation_2(x)
+        y = self.activation_relu(y)
 
-        return x
+        return y
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -133,63 +156,6 @@ class DoubleBlazeBlock(tf.keras.layers.Layer):
 #          896 = 512 anchors small (16x16x2) + 384 anchors big (8x8x6)
 # ═════════════════════════════════════════════════════════════════════════════
 
-# %% md
-## Model
-# %%
-# class BlazeModel(tf.keras.Model):
-#     def __init__(self, **kwargs):
-#         super(BlazeModel, self).__init__(**kwargs)
-#
-#         self.stem = layers.Conv2D(24, (5, 5), strides=2, padding='same')
-#         self.stem_relu = layers.ReLU()
-#
-#         self.encoder_small = tf.keras.Sequential([
-#             BlazeBlock(filters=24, strides=1),
-#             BlazeBlock(filters=24, strides=1),
-#             BlazeBlock(filters=48, strides=2),
-#             BlazeBlock(filters=48, strides=1),
-#             BlazeBlock(filters=48, strides=1)
-#         ], name="encoder_small")
-#
-#         self.encoder_large = tf.keras.Sequential([
-#             DoubleBlazeBlock(filters=96, strides=2),
-#             DoubleBlazeBlock(filters=96, strides=1),
-#             DoubleBlazeBlock(filters=96, strides=1),
-#             DoubleBlazeBlock(filters=96, strides=2),
-#             DoubleBlazeBlock(filters=96, strides=1),
-#             DoubleBlazeBlock(filters=96, strides=1)
-#         ], name="encoder_large")
-#
-#         self.scores_small = layers.Conv2D(2, (1, 1), strides=(1, 1), activation='sigmoid')
-#         self.scores_large = layers.Conv2D(6, (1, 1), strides=(1, 1), activation='sigmoid')
-#
-#         self.boxes_small = layers.Conv2D(8, (1, 1), strides=(1, 1))
-#         self.boxes_large = layers.Conv2D(24, (1, 1), strides=(1, 1))
-#
-#     def call(self, inputs, training=False):
-#         x = self.stem_relu(self.stem(inputs))
-#
-#         features_16x16 = self.encoder_small(x, training=training)
-#         features_8x8 = self.encoder_large(features_16x16, training=training)
-#
-#         scores = self._merge_heads(
-#             self.scores_small(features_16x16),
-#             self.scores_large(features_8x8),
-#             last_dim=1
-#         )
-#         boxes = self._merge_heads(
-#             self.boxes_small(features_16x16),
-#             self.boxes_large(features_8x8),
-#             last_dim=4
-#         )
-#
-#         return scores, boxes
-#
-#     def _merge_heads(self, small, large, last_dim):
-#         return layers.concatenate([
-#             layers.Reshape((-1, last_dim))(small),
-#             layers.Reshape((-1, last_dim))(large),
-#         ], axis=1)
 
 class BlazeModel(tf.keras.Model):
     def __init__(self, **kwargs):
@@ -197,19 +163,12 @@ class BlazeModel(tf.keras.Model):
 
         self.conv = layers.Conv2D(24, (5, 5), strides=2, padding='same')
         self.activation = layers.ReLU()
-
-        self.block1 = BlazeBlock(filters=24, strides=1)
-        self.block2 = BlazeBlock(filters=24, strides=1)
-        self.block3 = BlazeBlock(filters=48, strides=2)
-        self.block4 = BlazeBlock(filters=48, strides=1)
-        self.block5 = BlazeBlock(filters=48, strides=1)
-
-        self.block6 = DoubleBlazeBlock(filters=96, strides=2)
-        self.block7 = DoubleBlazeBlock(filters=96, strides=1)
-        self.block8 = DoubleBlazeBlock(filters=96, strides=1)
-        self.block9 = DoubleBlazeBlock(filters=96, strides=2)
-        self.block10 = DoubleBlazeBlock(filters=96, strides=1)
-        self.block11 = DoubleBlazeBlock(filters=96, strides=1)
+        self.blocks = []
+        for block, filters, stride in CONFIG_BACKBONE:
+            if block == "s":
+                self.blocks.append(BlazeBlock(filters, stride))
+            else:
+                self.blocks.append(DoubleBlazeBlock(filters, stride))
 
         self.classifier_8 = layers.Conv2D(2, (1, 1), strides=(1, 1), activation='sigmoid')
         self.classifier_16 = layers.Conv2D(6, (1, 1), strides=(1, 1), activation='sigmoid')
@@ -218,60 +177,31 @@ class BlazeModel(tf.keras.Model):
         self.regressor_16 = layers.Conv2D(24, (1, 1), strides=(1, 1))
 
     def call(self, inputs):
-        # tf.print("Input size conv:", tf.shape(inputs))
         x = self.conv(inputs)
-        # tf.print("Input size ReLu:", tf.shape(x))
         x = self.activation(x)
 
-        # tf.print("Input size Single BlazeBlock_1:", tf.shape(x))
-        x = self.block1(x)
-        # tf.print("Input size Single BlazeBlock_2:", tf.shape(x))
-        x = self.block2(x)
-        # tf.print("Input size Single BlazeBlock_3:", tf.shape(x))
-        x = self.block3(x)
-        # tf.print("Input size Single BlazeBlock_4:", tf.shape(x))
-        x = self.block4(x)
-        # tf.print("Input size Single BlazeBlock_5:", tf.shape(x))
-        x = self.block5(x)
+        for i in range(8):
+            x = self.blocks[i](x)
 
-        # tf.print("Input size Double BlazeBlock_1:", tf.shape(x))
-        x = self.block6(x)
-        # tf.print("Input size Double BlazeBlock_2:", tf.shape(x))
-        x = self.block7(x)
-        # tf.print("Input size Double BlazeBlock_3:", tf.shape(x))
-        x = self.block8(x)
-        # tf.print("Input size Double BlazeBlock_4:", tf.shape(x))
-        h = self.block9(x)
-        # tf.print("Input size Double BlazeBlock_5:", tf.shape(h))
-        h = self.block10(h)
-        # tf.print("Input size Double BlazeBlock_6:", tf.shape(h))
-        h = self.block11(h)
+        h = x
 
-        # tf.print("Input size classifier_8:", tf.shape(x))
+        for i in range(8, 11):
+            h = self.blocks[i](h)
+
         c1 = self.classifier_8(x)
-        # tf.print("Input size reshape:", tf.shape(c1))
         c1 = layers.Reshape((-1, 1))(c1)
-
-        # tf.print("Input size classifier_16:", tf.shape(h))
         c2 = self.classifier_16(h)
-        # tf.print("Input size reshape:", tf.shape(c2))
         c2 = layers.Reshape((-1, 1))(c2)
 
         c = layers.concatenate([c1, c2], axis=1)
-        # tf.print("Output size classifier_concat:", tf.shape(c))
 
-        # tf.print("Input size regressor_8:", tf.shape(x))
         r1 = self.regressor_8(x)
-        # tf.print("Input size reshape:", tf.shape(r1))
         r1 = layers.Reshape((-1, 4))(r1)
 
-        # tf.print("Input size regressor_16:", tf.shape(h))
         r2 = self.regressor_16(h)
-        # tf.print("Input size reshape:", tf.shape(r2))
         r2 = layers.Reshape((-1, 4))(r2)
 
         r = layers.concatenate([r1, r2], axis=1)
-        # tf.print("Output size regressor_concat:", tf.shape(r))
 
         return c, r
 
