@@ -14,6 +14,8 @@ from lib.metrics  import evaluate_detections, DetectionMetrics
 from lib.training import (TrainingHistory, save_checkpoint, load_latest_checkpoint,
                            print_step, print_epoch, plot_history)
 
+from lib.utils import ModelInspector
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 0. config
 # ═════════════════════════════════════════════════════════════════════════════
@@ -598,3 +600,10 @@ class BlazeFaceDetector:
     def load(self, path):
         self.model.load_weights(path)
         print(f"Model load : {path}")
+
+
+if __name__ == "__main__":
+    print("--- Check ---")
+    model = BlazeModel()
+
+    ModelInspector.trace(model, input_shape=(224, 224, 3))

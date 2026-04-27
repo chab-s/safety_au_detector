@@ -212,7 +212,7 @@ def hard_swish(x):
 
 
 if __name__ == "__main__":
-    print("--- Début du test ---")
+    print("--- Check ---")
     model = MobileNetV3(mode="large", num_classes=1000)
 
     ModelInspector.trace(model, input_shape=(224, 224, 3))
