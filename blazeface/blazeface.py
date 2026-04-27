@@ -59,20 +59,20 @@ CONFIG_BACKBONE = [
 # ═════════════════════════════════════════════════════════════════════════════
 
 class BlazeBlock(tf.keras.layers.Layer):
-    def __init__(self, filters, strides=1, use_skip=True, **kwargs):
+    def __init__(self, kernel_size, strides=1, use_skip=True, **kwargs):
         super(BlazeBlock, self).__init__(**kwargs)
         self.use_skip = use_skip
 
         self.conv = tf.keras.Sequential([
             layers.DepthwiseConv2D((5, 5), strides=strides, padding='same'),
             layers.BatchNormalization(),
-            layers.Conv2D(filters, (1, 1), strides=(1, 1)),
+            layers.Conv2D(kernel_size, (1, 1), strides=(1, 1)),
             layers.BatchNormalization()
         ])
 
         if self.use_skip:
             self.skip = layers.MaxPool2D(pool_size=2, strides=strides, padding='same')
-            self.channel_pad = layers.Lambda(lambda x: self._pad_channels(x, filters))
+            self.channel_pad = layers.Lambda(lambda x: self._pad_channels(x, kernel_size))
 
         self.activation = layers.ReLU()
 
@@ -100,26 +100,29 @@ class BlazeBlock(tf.keras.layers.Layer):
 
 
 class DoubleBlazeBlock(tf.keras.layers.Layer):
-    def __init__(self, filters, strides, use_pool=True, **kwargs):
+    def __init__(self, kernel_size, strides, use_pool=True, **kwargs):
         super(DoubleBlazeBlock, self).__init__(**kwargs)
 
         self.use_pool = use_pool
 
         if use_pool:
             self.skip = layers.MaxPool2D(pool_size=2, strides=strides, padding='same')
-            self.channel_pad = layers.Lambda(lambda x: self._pad_channels(x, filters))
+            self.channel_pad = layers.Lambda(lambda x: self._pad_channels(x, kernel_size))
 
         self.activation_relu = layers.ReLU()
 
-        self.conv = tf.keras.Sequential([
+        self.conv_dw_project = tf.keras.Sequential([
             layers.DepthwiseConv2D((5, 5), strides=strides, padding='same'),
             layers.BatchNormalization(),
-            layers.Conv2D(filters, (1, 1), strides=(1, 1)),
+            layers.Conv2D(kernel_size, (1, 1), strides=(1, 1)),
             layers.BatchNormalization(),
             self.activation_relu,
+        ])
+
+        self.conv_dw_expand = tf.keras.Sequential([
             layers.DepthwiseConv2D((5, 5), strides=(1, 1), padding='same'),
             layers.BatchNormalization(),
-            layers.Conv2D(filters, (1, 1), strides=(1, 1)),
+            layers.Conv2D(kernel_size, (1, 1), strides=(1, 1)),
             layers.BatchNormalization()
         ])
 
@@ -136,7 +139,8 @@ class DoubleBlazeBlock(tf.keras.layers.Layer):
         return tf.pad(x, paddings, mode='CONSTANT', constant_values=0)
 
     def call(self, inputs, training=False):
-        y = self.conv(inputs, training=training)
+        y = self.conv_dw_project(inputs, training=training)
+        y = self.conv_dw_expand(y, training=training)
 
         if self.use_pool:
             skip = self.skip(inputs)
@@ -164,11 +168,11 @@ class BlazeModel(tf.keras.Model):
         self.conv = layers.Conv2D(24, (5, 5), strides=2, padding='same')
         self.activation = layers.ReLU()
         self.blocks = []
-        for block, filters, stride in CONFIG_BACKBONE:
+        for block, kernel_size, stride in CONFIG_BACKBONE:
             if block == "s":
-                self.blocks.append(BlazeBlock(filters, stride))
+                self.blocks.append(BlazeBlock(kernel_size, stride))
             else:
-                self.blocks.append(DoubleBlazeBlock(filters, stride))
+                self.blocks.append(DoubleBlazeBlock(kernel_size, stride))
 
         self.classifier_8 = layers.Conv2D(2, (1, 1), strides=(1, 1), activation='sigmoid')
         self.classifier_16 = layers.Conv2D(6, (1, 1), strides=(1, 1), activation='sigmoid')
@@ -451,7 +455,6 @@ def _read_image(image_path):
 
 
 def _build_anchor_grids(image_path, flip, boxes_dict, anchors):
-    """Construit les grilles d'anchors pour une image (appelé via py_function)."""
     key = image_path.numpy().decode("utf-8")
     boxes = boxes_dict[key]
 
