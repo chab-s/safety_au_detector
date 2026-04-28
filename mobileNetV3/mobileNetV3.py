@@ -1,13 +1,6 @@
-import os
-import time
-import numpy as np
-import pandas as pd
 import tensorflow as tf
-import cv2
-from keras.src.legacy.saving.legacy_h5_format import HDF5_OBJECT_HEADER_LIMIT
 
 from tensorflow.keras import layers
-from tensorflow.keras import activations
 from lib.utils import ModelInspector
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -155,6 +148,10 @@ class Conv1x1Bn(layers.Layer):
         return self.conv(inputs, training=training)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# 2. MODEL
+# ═════════════════════════════════════════════════════════════════════════════
+
 
 class MobileNetV3(layers.Layer):
     def __init__(self, mode, num_classes=1000, width_mult=1.):
@@ -213,7 +210,7 @@ def hard_swish(x):
 
 if __name__ == "__main__":
     print("--- Check ---")
-    model = MobileNetV3(mode="large", num_classes=1000)
+    model = MobileNetV3(mode="large", num_classes=96)
 
     ModelInspector.trace(model, input_shape=(224, 224, 3))
 

@@ -20,13 +20,6 @@ from lib.utils import ModelInspector
 # 0. config
 # ═════════════════════════════════════════════════════════════════════════════
 
-# @dataclasses
-# class Level:
-#     name: str
-#     kernel_size: tuple
-#     strides: int
-#     type: str
-
 
 CONFIG_BB = [
     ((5, 5), 'same'),

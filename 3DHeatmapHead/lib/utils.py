@@ -36,9 +36,9 @@ class ModelInspector:
             print(f"Output_channels : {current_x.shape}")
             print("=" * 50 + "\n")
 
-    @staticmethod
-    def count_params(model):
-        trainable = sum([np.prod(p.shape) for p in model.trainable_variables])
-        non_trainable = sum([np.prod(p.shape) for p in model.non_trainable_variables])
-        print(f"Total Params: {trainable + non_trainable:,}")
-        print(f"Trainable: {trainable:,}")
+        @staticmethod
+        def count_params(model):
+            trainable = sum([np.prod(p.shape) for p in model.trainable_variables])
+            non_trainable = sum([np.prod(p.shape) for p in model.non_trainable_variables])
+            print(f"Total Params: {trainable + non_trainable:,}")
+            print(f"Trainable: {trainable:,}")
