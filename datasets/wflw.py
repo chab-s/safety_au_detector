@@ -1,3 +1,4 @@
+import tensorflow
 import tensorflow as tf
 import os
 import csv
@@ -5,6 +6,7 @@ import numpy as np
 import pandas as pd
 import cv2
 import albumentations as A
+from tqdm import tqdm
 
 NUM_LM = 98
 
@@ -30,141 +32,203 @@ FLIP_MAP = (
 
 
 class WFLW():
-    def __init__(self, cfg, training: bool = True, transform = None, augmentation: bool = False):
+    def __init__(self, cfg, training: bool = True, transform = None):
         self.cfg = cfg
+        self.is_train = training
+        self.input_size = cfg.MODEL.IMAGE_SIZE
+        self.augmentation = cfg.TRAIN.AUGMENTATION
+
+        self.out_csv = None
+        if cfg.DATASET.SAVE:
+            self.out_csv = cfg.DATASET.ROOT.CSV
+
         csv_exists = any(f.endswith(".csv") for f in os.listdir(cfg.DATASET.ROOT.TRAIN))
         if not csv_exists:
-            self.preprocess(cfg.DATASET.ROOT.CSV, special_data=True, augmentation=augmentation, normalize=True)
-        self.data = pd.read_csv(cfg.DATASET.ROOT.CSV)
-        self.is_train = training
-        self.transform = transform
-        self.data_root = cfg.DATASET.ROOT
-        self.input_size = cfg.MODEL.IMAGE_SIZE
-        self.output_size = cfg.MODEL.HEATMAP_SIZE
-        self.sigma = cfg.MODEL.SIGMA
-        self.landmarks = None
+            self.data = self.preprocess(self.out_csv, add_attribute_subsets=False, normalize=True)
+        else:
+            self.data = pd.read_csv(cfg.DATASET.ROOT.CSV)
+
+        if self.is_train:
+            self.data = self.data[self.data['split'] == 'train'].reset_index(drop=True)
+        else:
+            self.data = self.data[self.data['split'] == 'test'].reset_index(drop=True)
 
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
+        if self.augmentation:
+            self.augm = self.augmentation_pipeline(self.input_size)
+
     def __len__(self):
         return self.data.shape
 
-    def __getitem__(self, i: int, image_name: str = None):
-        if image_name is None:
-            image_name = self.data["image_path"][i]
+    def __getitem__(self, i: int = None, image_name: str = None):
+        if image_name is not None:
+            i = self.data[self.data["image_path"] == image_name].index[0]
+        image_name = self.data["image_path"][i]
+        landmarks = self.data.iloc[i, :196].values
+        split = self.data["split"][i]
+
         image_path = os.path.join(cfg.DATASET.ROOT.IMAGES, image_name)
         image = np.array(cv2.imread(image_path, cv2.IMREAD_COLOR_RGB), dtype=np.float32)
-        h, w = image.shape[:2]
+        image = cv2.resize(image, self.input_size)
         image = (image/255.0 - self.mean) / self.std
         image = image.transpose([2, 0, 1])
-        image = tf.convert_to_tensor(np.expand_dims(image, 0))
-        landmarks = self.data.iloc[i, :196].values
         landmarks = tf.convert_to_tensor(landmarks, dtype=tf.float32)
         landmarks = tf.reshape(landmarks, (-1, 2))
 
         # scale *= 1,25
 
-        meta = {'index': i, 'image_name': image_name, 'pts': tf.convert_to_tensor(landmarks)}
+        meta = {'index': i, 'image_name': image_name, 'split': split}
 
-        return image, meta
+        return tf.convert_to_tensor(image), tf.convert_to_tensor(landmarks), meta
 
-    def preprocess(self, out_csv: str, special_data: bool = False, augmentation: bool = False, normalize: bool = True):
-        header = []
+    def process(self, image_name: str, augmentation: bool = False):
+        image, landmarks, meta = self.__getitem__(image_name=image_name)
+        landmarks *= self.input_size
+        if meta["split"] == "train":
+            self.images_train.append(image)
+            self.landmarks_train.append(landmarks)
+            if augmentation:
+                image = image.numpy()
+                if image.shape[0] == 3 or image.shape[0] == 1:
+                    image = image.transpose(1, 2, 0)
+                augm = self.augmentation_pipeline(cfg.MODEL.IMAGE_SIZE)
+                apply_aug = augm(image=image, landmarks=landmarks)
+                aug_image = apply_aug.get('image')
+                aug_landmarks = list(apply_aug["landmarks"])
+                # if dataset_wflw.flip_was_applied(apply_aug.get("replay")):
+                #     aug_landmarks = dataset_wflw.apply_flip_map(aug_landmarks)
+                aug_image = aug_image.transpose([2, 0, 1])
+                aug_image = tf.convert_to_tensor(aug_image, dtype=tf.float32)
+                self.images_train.append(aug_image)
+                self.landmarks_train.append(aug_landmarks)
 
-        for i in range(98):
-            header.extend([f'x{i}', f'y{i}'])
-        header.extend(['x_upper_left_corner', 'y_upper_left_corner'])
-        header.extend(['x_lower_right_corner', 'y_lower_right_corner'])
-        header.append('pose')
-        header.append('expression')
-        header.append('illumination')
-        header.append('make-up')
-        header.append('occlusion')
-        header.append('blur')
-        header.append('image_path')
-        header.append("split")
+                # def draw(ax, img, kps, title):
+                #     ax.imshow(img)
+                #     ax.scatter([p[0] for p in kps], [p[1] for p in kps], s=8, c="lime", linewidths=0.5)
+                #     ax.set_title(title)
+                #     ax.axis("off")
+                #
+                # import matplotlib.pyplot as plt
+                # _, axes = plt.subplots(1, 2, figsize=(10, 5))
+                # draw(axes[0], image, landmarks.numpy(), "Original")
+                # draw(axes[1], aug_image, aug_landmarks, "Augmenté")
+                # plt.tight_layout()
+                # plt.savefig("augmentation_sample.png", dpi=150)
+                # plt.show()
+                # print("→ augmentation_sample.png")
+
+        elif meta["split"] == "test":
+            self.images_test.append(image)
+            self.landmarks_test.append(landmarks)
+
+        yield self.images_train, self.landmarks_train, self.images_test, self.landmarks_test
+
+    def _iter_rows(self, add_attribute_subsets: bool = False, normalize: bool = True):
+        list_dir = (
+            os.listdir(self.cfg.DATASET.ROOT.TRAIN) + os.listdir(self.cfg.DATASET.ROOT.ATTRIBUTE_SUBSET)
+            if add_attribute_subsets
+            else os.listdir(self.cfg.DATASET.ROOT.TRAIN)
+        )
+
+        for file in tqdm(list_dir, desc="Preprocessing Dataset"):
+            if not file.endswith('.txt'):
+                continue
+
+            split = "train" if "train.txt" in file.split("_") else "test"
+            file_path = os.path.join(self.cfg.DATASET.ROOT.TRAIN, file)
+
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    data = line.split()
+                    image_path = data[-1]
+                    if not data:
+                        continue
+
+                    landmarks = np.array(data[:196], dtype=float)
+
+                    if normalize:
+                        image = cv2.imread(os.path.join(self.cfg.DATASET.ROOT.IMAGES, image_path))
+                        h, w = image.shape[:2]
+                        landmarks[0::2] /= w
+                        landmarks[1::2] /= h
+
+                    row = landmarks.tolist() + data[196:] + [split]
+                    yield self._row_to_dict(row)
+
+    def _row_to_dict(self, row: list) -> dict:
+        keys = (
+                [coord for i in range(98) for coord in (f'x{i}', f'y{i}')]
+                + ['x_upper_left_corner', 'y_upper_left_corner',
+                   'x_lower_right_corner', 'y_lower_right_corner',
+                   'pose', 'expression', 'illumination', 'make-up',
+                   'occlusion', 'blur', 'image_path', 'split']
+        )
+        return dict(zip(keys, row))
 
 
-        with open(out_csv, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(header)
-            list_dir = os.listdir(self.cfg.DATASET.ROOT.TRAIN) + os.listdir(self.cfg.DATASET.ROOT.SPECIAL) if special_data else os.listdir(self.cfg.DATASET.ROOT.TRAIN)
-            for file in list_dir:
-                if "train" in file.split("_"):
-                    split = "train"
-                else:
-                    split = "test"
-                if file.endswith('.txt'):
-                    file_path = os.path.join(self.cfg.DATASET.ROOT.TRAIN, file)
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        for line in f:
-                            data = line.split()
-                            if normalize:
-                                image = cv2.imread(os.path.join(self.cfg.DATASET.ROOT.IMAGES, data[-1]))
+    def preprocess(self, out_csv: str = None, add_attribute_subsets: bool = False, normalize: bool = True):
+        header = list(self._row_to_dict([None] * 208).keys())
+        rows = self._iter_rows(add_attribute_subsets=add_attribute_subsets, normalize=normalize)
+        self.data = pd.DataFrame(rows, columns=header)
+        if out_csv is not None:
+            self.data.to_csv(out_csv, index=False, encoding='utf-8')
+            print(f"CSV sauvegardé : {out_csv}")
 
-                                h, w = image.shape[:2]
-
-                                landmarks = np.array(data[:196], dtype=float)
-
-                                landmarks[0::2] /= w
-                                landmarks[1::2] /= h
-
-                                data = landmarks.tolist() + data[196:]
-
-                        data.append(split)
-                        if data:
-                            writer.writerow(data)
-
-        print(f"cvs file saved to {out_csv}")
+        return self.data
 
 
     def augmentation_pipeline(self, size: int) -> A.ReplayCompose:
         return A.ReplayCompose(
             [
-                A.HorizontalFlip(p=1.0),
-            #     A.Rotate(
-            #         limit=20,
-            #         border_mode=cv2.BORDER_CONSTANT,
-            #         p=0.7
-            #     ),
-            #     A.Affine(
-            #         translate_percent=0.06,
-            #         scale=0.15,
-            #         rotate=20,
-            #         border_mode=cv2.BORDER_CONSTANT,
-            #         p=0.5
-            #     ),
-            #     A.RandomResizedCrop(
-            #         size=(size, size),
-            #         scale=(0.85, 1.0),
-            #         p=0.4
-            #     ),
-            #     A.Resize(size, size, p=1.0),
-            #     A.RandomBrightnessContrast(
-            #         brightness_limit=0.3,
-            #         contrast_limit=0.3,
-            #         p=0.6
-            #     ),
-            #     A.HueSaturationValue(
-            #         hue_shift_limit=10,
-            #         sat_shift_limit=30,
-            #         val_shift_limit=20,
-            #         p=0.4
-            #     ),
-            #     A.GaussNoise(std_range=(0.02, 0.12), p=0.3),
-            #     A.MotionBlur(blur_limit=5, p=0.2),
-            #     A.CLAHE(clip_limit=2.0, p=0.2),
-            #     A.ImageCompression(quality_range=(70, 100), p=0.2),
-            #
-            #     # ── Occlusions / CoarseDropout ────────────────────────────
-            #     A.CoarseDropout(
-            #         num_holes_range=(1, 4),
-            #         hole_height_range=(10, 40),
-            #         hole_width_range=(10, 40),
-            #         fill=0,
-            #         p=0.3
-            #     )
+                A.HorizontalFlip(p=0.5),
+                A.Rotate(
+                    limit=(-20, 20),
+                    border_mode=cv2.BORDER_REFLECT_101,
+                    p=0.7
+                ),
+                A.Affine(
+                    translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
+                    scale=(0.85, 1.15),
+                    rotate=(-20, 20),
+                    border_mode=cv2.BORDER_REFLECT_101,
+                    p=0.5
+                ),
+                A.RandomResizedCrop(
+                    size=size,
+                    scale=(0.85, 1.0),
+                    p=0.6
+                ),
+                A.Resize(
+                    height=size[0], width=size[1],
+                    interpolation=cv2.INTER_LINEAR,
+                    p=1.0
+                ),
+                A.RandomBrightnessContrast(
+                    brightness_limit=(0.7, 1.3),
+                    contrast_limit=(0.7, 1.3),
+                    p=0.6
+                ),
+                A.HueSaturationValue(
+                    hue_shift_limit=(-10, 10),
+                    sat_shift_limit=(-30, 30),
+                    val_shift_limit=(-20, 20),
+                    p=0.4
+                ),
+                A.GaussNoise(std_range=(0.02, 0.12), p=0.3),
+                A.MotionBlur(blur_limit=5, p=0.2),
+                A.CLAHE(clip_limit=2.0, p=0.2),
+                A.ImageCompression(quality_range=(70, 100), p=0.2),
+
+                # ── Occlusions / CoarseDropout ────────────────────────────
+                A.CoarseDropout(
+                    num_holes_range=(1, 4),
+                    hole_height_range=(10, 40),
+                    hole_width_range=(10, 40),
+                    fill=0,
+                    p=0.3
+                )
             ],
             keypoint_params=A.KeypointParams(
                 format="xy",
@@ -218,53 +282,12 @@ def load_config(file_path: str) -> SimpleNamespace:
 
 if __name__ == "__main__":
     cfg = load_config("config/config.yaml")
-    out_csv = os.path.join(cfg.DATASET.ROOT.TRAIN, "wflw.csv")
     dataset_wflw = WFLW(cfg)
     print(dataset_wflw.__len__())
-    print(dataset_wflw[0])
-    # dataset_wflw.preprocess(out_csv, special_data=False)$
-    exit()
-    data = pd.read_csv(out_csv)
-    # df2 = pd.read_csv(out_csv_full)
-    # print(data.info(), df2.info())
+    train_images, train_landmarks, test_images, test_landmarks = dataset_wflw.process(augmentation = cfg.TRAIN.AUGMENTATION)
+    print(tf.shape(dataset_wflw.images_train), tf.shape(dataset_wflw.landmarks_train))
+    print(tf.shape(dataset_wflw.images_test), tf.shape(dataset_wflw.landmarks_test))
 
-    augm = dataset_wflw.augmentation_pipeline(256)
-    im_path = os.path.join("datasets/WFLW_images",  data['image_path'][0])
-    img = cv2.imread(im_path, cv2.IMREAD_COLOR_RGB)
-    row = data.iloc[0]
-    coords = row[:196].values.astype('float32')
-    keypoints = [(float(p[0]), float(p[1])) for p in coords.reshape(-1, 2)]
-    applied_augm = augm(image=img, keypoints=keypoints)
-    aug_img = applied_augm.get('image')
-    aug_keypoints = list(applied_augm["keypoints"])
-    print(dataset_wflw.flip_was_applied(applied_augm.get("replay")))
-    if dataset_wflw.flip_was_applied(applied_augm.get("replay")):
-        aug_keypoints = dataset_wflw.apply_flip_map(aug_keypoints)
-    print(len(aug_keypoints))
-    if len(aug_keypoints) < 98:
-        aug_keypoints = dataset_wflw.reconstruct_keypoints(aug_keypoints, keypoints, 256)
-
-    new_name = f"test.jpg"
-    cv2.imwrite(
-        new_name,
-        cv2.cvtColor(aug_img, cv2.COLOR_RGB2BGR),
-    )
-
-
-    def draw(ax, img, kps, title):
-        ax.imshow(img)
-        ax.scatter([p[0] for p in kps], [p[1] for p in kps], s=8, c="lime", linewidths=0.5)
-        ax.set_title(title)
-        ax.axis("off")
-
-    import matplotlib.pyplot as plt
-    _, axes = plt.subplots(1, 2, figsize=(10, 5))
-    draw(axes[0], img, keypoints, "Original")
-    draw(axes[1], aug_img, aug_keypoints, "Augmenté")
-    plt.tight_layout()
-    plt.savefig("augmentation_sample.png", dpi=150)
-    plt.show()
-    print("→ augmentation_sample.png")
 
 
 
