@@ -207,7 +207,7 @@ class BlazeModel(tf.keras.Model):
 
         r = layers.concatenate([r1, r2], axis=1)
 
-        return c, r
+        return h, c, r
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -301,7 +301,7 @@ HARD_BACKGROUND_RATIO = 3
 
 huber_loss = tf.keras.losses.Huber()
 
-def compute_loss(predicted_scores, predicted_boxes, grid_small, grid_large, anchors, image_size: int = 128):
+def compute_bbox_loss(predicted_scores, predicted_boxes, grid_small, grid_large, anchors, image_size: int = 128):
     true_boxes, true_classes = _extract_ground_truth(grid_small, grid_large)
     face_mask = tf.dtypes.cast(true_classes, tf.bool)
     cls_loss = _classification_loss(predicted_scores, true_classes, face_mask)
@@ -481,6 +481,20 @@ def _flip_box_horizontal(box):
 #   boxes    = detector.predict(images)
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _apply_nms(scores, boxes, anchors, input_size, SCORE_THRESHOLD, NMS_THRESHOLD):
+    decoded = _decode_boxes(boxes, anchors, input_size)
+    scores_flat = tf.squeeze(scores, axis=-1)
+    detections = []
+    for i in range(scores_flat.shape[0]):
+        mask = tf.where(scores_flat[i] >= SCORE_THRESHOLD)[:, 0]
+        candidates = [
+            tf.concat([scores_flat[i, j:j + 1], decoded[i, j]], axis=0)
+            for j in mask
+        ]
+        detections.append(nms(candidates, NMS_THRESHOLD))
+
+    return detections
+
 class BlazeFaceDetector:
 
     INPUT_SIZE = 128
@@ -499,7 +513,7 @@ class BlazeFaceDetector:
     # ── Prediction ─────────────────────────────────────────────────────────
 
     def predict(self, images):
-        scores, boxes = self.model.predict(images)
+        _, scores, boxes = self.model.predict(images)
         return self._apply_nms(scores, boxes)
 
     def _apply_nms(self, scores, boxes):
@@ -544,8 +558,8 @@ class BlazeFaceDetector:
     @tf.function
     def _train_step(self, images, grid_small, grid_large):
         with tf.GradientTape() as tape:
-            scores, boxes = self.model(images, training=True)
-            loss, pred_coords, true_coords = compute_loss(
+            _, scores, boxes = self.model(images, training=True)
+            loss, pred_coords, true_coords = compute_bbox_loss(
                 scores, boxes, grid_small, grid_large, self.anchors, self.INPUT_SIZE
             )
         gradients = tape.gradient(loss, self.model.trainable_variables)
