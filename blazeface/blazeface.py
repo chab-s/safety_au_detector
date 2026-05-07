@@ -9,8 +9,8 @@ import matplotlib.patches as patches
 
 from tensorflow.keras import layers
 
-from lib.vision   import compute_iou, mean_iou, nms, crop_and_resize_with_boxes
-from lib.metrics  import evaluate_detections, DetectionMetrics
+from lib.vision import compute_iou, mean_iou, nms, crop_and_resize_with_boxes
+from lib.metrics import evaluate_detections, DetectionMetrics
 from lib.training import (TrainingHistory, save_checkpoint, load_latest_checkpoint,
                            print_step, print_epoch, plot_history)
 
@@ -157,8 +157,10 @@ class DoubleBlazeBlock(tf.keras.layers.Layer):
 
 
 class BlazeModel(tf.keras.Model):
-    def __init__(self, **kwargs):
+    def __init__(self, backbone_mode: bool = False, **kwargs):
         super(BlazeModel, self).__init__(**kwargs)
+
+        self.backbone_mode = backbone_mode
 
         self.conv = layers.Conv2D(24, (5, 5), strides=2, padding='same')
         self.activation = layers.ReLU()
@@ -186,6 +188,9 @@ class BlazeModel(tf.keras.Model):
 
         for i in range(8, 11):
             h = self.blocks[i](h)
+
+        if self.backbone_mode:
+            return h
 
         c1 = self.classifier_8(x)
         c1 = layers.Reshape((-1, 1))(c1)
@@ -599,4 +604,4 @@ if __name__ == "__main__":
     print("--- Check ---")
     model = BlazeModel()
 
-    ModelInspector.trace(model, input_shape=(224, 224, 3))
+    ModelInspector.trace(model, input_shape=(256, 256, 3))

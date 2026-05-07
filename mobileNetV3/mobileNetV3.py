@@ -172,7 +172,7 @@ class MobileNetV3(layers.Layer):
         bneck_layers = []
         input_channels = _make_divisible(16 * width_mult, 8)
         for _, kernel_size, exp_size, output_channels, use_se, use_hs, strides in conf:
-            print(_, kernel_size, exp_size, output_channels, use_se, use_hs, strides)
+            # print(_, kernel_size, exp_size, output_channels, use_se, use_hs, strides)
             output_channels = _make_divisible(output_channels * width_mult, 8)
             exp_size = _make_divisible(exp_size * width_mult, 8)
             bneck_layers.append(InvertedResidual(input_channels, kernel_size, exp_size, output_channels, use_se, use_hs, strides))
@@ -185,15 +185,18 @@ class MobileNetV3(layers.Layer):
         self.head = tf.keras.Sequential([
             Conv1x1Bn(last_conv_channels, 1, use_norm=True, use_hs=True),
             layers.GlobalAveragePooling2D(),
+
             # classification
             # layers.Reshape((1, 1, last_conv_channels)),
             # Conv1x1Bn(final_expand_channels, 1, use_norm=False, use_hs=True),
             # layers.Conv2D(num_classes, 1, strides=1, padding="same", use_bias=False),
             # layers.Flatten(),
-            layers.Dense(final_expand_channels),
-            layers.Activation(hard_swish),
-            layers.Dropout(0.2),
-            layers.Dense(num_classes, activation=None)
+
+            # Regression
+            # layers.Dense(final_expand_channels),
+            # layers.Activation(hard_swish),
+            # layers.Dropout(0.2),
+            # layers.Dense(num_classes, activation=None)
         ])
 
     def call(self, inputs, training=False):
@@ -210,7 +213,7 @@ def hard_swish(x):
 
 if __name__ == "__main__":
     print("--- Check ---")
-    model = MobileNetV3(mode="large", num_classes=96)
+    model = MobileNetV3(mode="large", num_classes=68)
 
     ModelInspector.trace(model, input_shape=(224, 224, 3))
 

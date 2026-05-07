@@ -1,8 +1,26 @@
+# IDE et Système
+.DS_Store
+.idea/
+**/.DS_Store
+
+# Données et Poids (très important)
+**/data_files/
+**/face_dataset/
+**/weights/
+*.npy
+*.jpg
+*.png
+
+# Dossiers spécifiques que tu as cités
+HeatmapHead/
+config/
+lib/
+notebooks/weights/
+
+# Tes règles précédentes
 */created_dataset/
 checkpoints/
-data_files/archive_datasets/
-data_files/images/
-face_datasets/
 model/
 *.keras
-
+**/__pycache__/
+*.pyc
