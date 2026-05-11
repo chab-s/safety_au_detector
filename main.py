@@ -3,14 +3,13 @@
 # Press ⌃R to execute it or replace it with your code.
 # Press Double ⇧ to search everywhere for classes, files, tool windows, actions, and settings.
 import tensorflow as tf
-import cv2
-from lib.vision import visualize_side_by_side
-from lib.utils import ModelInspector
+from lib.training import (LandmarkTrainingHistory, save_checkpoint, load_latest_checkpoint,
+                           print_step, print_epoch, plot_history)
+import time
 
 from config.config import load_config
-from blazeface.blazeface import BlazeModel, compute_bbox_loss, build_anchors, _apply_nms, _decode_boxes
 from mobileNetV3.mobileNetV3 import MobileNetV3
-from HeatmapHead.head import HeatmapHead, get_aflw2k3d_dataset, generate_heatmaps, compute_hm_loss, compute_lm_loss
+from HeatmapHead.head import HeatmapHead, get_aflw2k3d_dataset, generate_heatmaps, compute_hm_loss, compute_lm_loss, compute_nme
 
 
 def build_bbox_cs(landmarks_gt, scale=1.0):
@@ -34,12 +33,12 @@ class LandmarksHead(tf.keras.Model):
     INPUT_SIZE = 128
     SCORE_THRESHOLD = 0.75
     NMS_THRESHOLD = 0.3
+    LR = 1e-4
+    CHECKPOINT_DIR = "checkpoints"
 
     def __init__(self, cfg, chekpoint_path: str = "./checkpoints"):
         super(LandmarksHead, self).__init__()
         self.cfg = cfg
-        self.backbone = BlazeModel(backbone_mode=False)
-        self.anchors = build_anchors()
         self.body = MobileNetV3(
             mode=cfg.MODEL.MODE,
             num_classes=cfg.MODEL.NUM_LANDMARKS
@@ -49,83 +48,84 @@ class LandmarksHead(tf.keras.Model):
             num_lm=cfg.MODEL.NUM_LANDMARKS,
             num_bins=cfg.MODEL.NUM_BINS
         )
+        dummy = tf.ones((1, 128, 128, 3))
+        features = self.body(dummy)
+        self.head(features)
+
         self.sigmas = tf.fill([cfg.TRAIN.BATCH_SIZE, cfg.MODEL.NUM_LANDMARKS], 1.0)
         self.areas = tf.fill([cfg.TRAIN.BATCH_SIZE, cfg.MODEL.NUM_LANDMARKS], 1.0)
-        self.optimizer = None
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
         self.checkpoint_path = chekpoint_path
 
     def predict(self, images):
         pass
 
-    def _train_step(self, images, grid_small=None, grid_large=None, landmarks=None):
+    def fit(self, train_dataset, epochs, resume=True):
+        history = LandmarkTrainingHistory()
+        start_epoch = load_latest_checkpoint(self.head, self.checkpoint_path) if resume else 0
+        total_steps = len(train_dataset)
+
+        for epoch in range(start_epoch, epochs):
+            epoch_start = time.time()
+            epoch_losses = []
+            epoch_nmes = []
+            for step, (images, landmarks) in enumerate(train_dataset):
+                loss, nme, pred_landmarks, pred_heatmaps = self._train_step(images, landmarks)
+                epoch_losses.append(loss.numpy())
+                epoch_nmes.append(float(tf.reduce_mean(nme).numpy()))
+
+                print_step(epoch, epochs, step + 1, total_steps,
+                           np.mean(epoch_losses), 'nme', np.mean(epoch_nmes),
+                           time.time() - epoch_start)
+
+            epoch_loss = np.mean(epoch_losses)
+            epoch_nme = np.mean(epoch_nmes)
+            history.update(epoch_loss, epoch_nme)
+
+            save_checkpoint(self.head, epoch, self.checkpoint_path)
+            print_epoch(epoch, epochs, 'nme', *history.last(), time.time() - epoch_start)
+
+        return history
+
+    @tf.function
+    def _train_step(self, images, gt_landmarks):
         images = tf.image.resize(images, [128, 128])
         with tf.GradientTape() as tape:
-            features, scores, pred_offsets = self.backbone(images, training=False)
-            features = self.body(features, training=True)
-            pred_landmarks = self.head(features, training=True)
+            features = self.body(images, training=True)
+            pred_landmarks, pred_heatmaps = self.head(features, training=True)
+            bbox_cs, bbox_size, sigmas, areas, x_bins_base, y_bins_base, z_bins_base = self.preprocess_data(images, gt_landmarks)
+            gt_hm_x, gt_hm_y, gt_hm_z = generate_heatmaps(
+                                    gt_landmarks, bbox_cs, sigmas, areas,
+                                    x_bins_base, y_bins_base, z_bins_base
+                                )
+            gt_hm = tf.stack([gt_hm_x, gt_hm_y, gt_hm_z], axis=2)
+            loss_hm = compute_hm_loss(gt_hm, pred_heatmaps, images)
+        gradients = tape.gradient(loss_hm, self.head.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.head.trainable_variables))
 
-            x_bins_base = tf.linspace(-1., 1., self.cfg.MODEL.NUM_BINS)
-            y_bins_base = tf.linspace(-1., 1., self.cfg.MODEL.NUM_BINS)
-            z_bins_base = tf.linspace(-1., 1., self.cfg.MODEL.NUM_BINS)
-            # pred_bbox_cs = _decode_boxes(pred_offsets, self.anchors, self.cfg.MODEL.IMAGE_SIZE)
-            pred_bbox_cs = _apply_nms(
-                scores, pred_offsets, self.anchors, self.cfg.MODEL.IMAGE_SIZE, self.SCORE_THRESHOLD, self.NMS_THRESHOLD
-            )
-            print(np.array(pred_bbox_cs).shape, pred_landmarks.shape)
-            hm_x, hm_y, hm_z = generate_heatmaps(
-                pred_landmarks, pred_bbox_cs, self.sigmas, self.areas,
-                x_bins_base, y_bins_base, z_bins_base
-            )
-            print(hm_x, hm_y, hm_z)
-            exit()
-            bbox_loss = compute_bbox_loss(scores, bbox_cs, grid_small=grid_small, grid_large=grid_large, anchors=self.anchors, image_size=self.cfg.MODEL.IMAGE_SIZE)
-            heatmap_loss = compute_hm_loss()
-            landamrks_loss = compute_lm_loss()
+        nme = compute_nme(pred_landmarks, gt_landmarks, bbox_size=bbox_size)
 
-            all_vars = self.backbone.trainable_variables + \
-                       self.body.trainable_variables + \
-                       self.head.trainable_variables
+        return loss_hm, nme, pred_landmarks, pred_heatmaps
 
-            total_loss = None
-            gradient = tape.gradient(total_loss, features)
-            self.optimizer.apply_gradients(zip(gradient, all_vars))
-            exit()
+    def preprocess_data(self, images, landmarks):
+        batch_size = tf.shape(images)[0]
+        num_landmarks = tf.shape(landmarks)[1]
+        bbox_cs = build_bbox_cs(landmarks, scale=1.2)
+        bbox_size = tf.reduce_mean(bbox_cs[:, 3:], axis=-1)
+        sigmas = tf.fill([batch_size, num_landmarks], 1.0)
+        areas = tf.fill([batch_size, num_landmarks], 1.0)
+        # areas = tf.tile(tf.expand_dims(bbox_size, 1), [1, num_landmarks])
+        num_bins = 64
+        x_bins_base = tf.linspace(-1., 1., num_bins)
+        y_bins_base = tf.linspace(-1., 1., num_bins)
+        z_bins_base = tf.linspace(0., 1.1, num_bins)
+
+        return bbox_cs, bbox_size, sigmas, areas, x_bins_base, y_bins_base, z_bins_base
 
 
 if __name__ == '__main__':
     conf = load_config("config/config.yaml")
     afl_dataset = get_aflw2k3d_dataset(conf)
-    dataset = afl_dataset.shuffle(1000).batch(32).prefetch(tf.data.AUTOTUNE)
+    train_dataset = afl_dataset.shuffle(1000).batch(32).prefetch(tf.data.AUTOTUNE)
     model = LandmarksHead(conf)
-    for images, landmarks in dataset.take(1):
-        model._train_step(images)
-
-    # afl_dataset = get_aflw2k3d_dataset(conf)
-    # dataset = afl_dataset.shuffle(1000).batch(32).prefetch(tf.data.AUTOTUNE)
-    # blaze_backbone = BlazeModel(backbone_mode=True)
-    # mobileNet_body = MobileNetV3(mode='small', num_classes=68)
-    # heatmap_head = HeatmapHead(input_shape=(576,), num_lm=68, num_bins=64)
-    #
-    # for images, landmarks in dataset.take(1):
-    #     print("landmarks min/max:", landmarks.numpy().min(), landmarks.numpy().max())
-    #     print(landmarks.shape)
-    #     batch_size = tf.shape(images)[0]
-    #     num_landmarks = tf.shape(landmarks)[1]
-    #     bbox_cs = build_bbox_cs(landmarks, scale=1.2)
-    #     bbox_size = tf.reduce_mean(bbox_cs[:, 3:], axis=-1)
-    #     sigmas = tf.fill([batch_size, num_landmarks], 1.0)
-    #     areas = tf.fill([batch_size, num_landmarks], 1.0)
-    #     # areas = tf.tile(tf.expand_dims(bbox_size, 1), [1, num_landmarks])
-    #     num_bins = 64
-    #     x_bins_base = tf.linspace(-1., 1., num_bins)
-    #     y_bins_base = tf.linspace(-1., 1., num_bins)
-    #     z_bins_base = tf.linspace(-1., 1., num_bins)
-    #
-    #     hm_x, hm_y, hm_z = generate_heatmaps(
-    #         landmarks, bbox_cs, sigmas, areas,
-    #         x_bins_base, y_bins_base, z_bins_base
-    #     )
-    #
-    #     visualize_side_by_side(
-    #         images[0].numpy(), landmarks[0].numpy(), hm_x[0].numpy(), hm_y[0].numpy(), bbox_cs[0].numpy()
-    #     )
+    model.fit(train_dataset, epochs=conf.TRAIN.EPOCHS, resume=True)
