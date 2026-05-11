@@ -5,7 +5,9 @@
 import tensorflow as tf
 from lib.training import (LandmarkTrainingHistory, save_checkpoint, load_latest_checkpoint,
                            print_step, print_epoch, plot_history)
+from lib.vision import visualize_side_by_side
 import time
+from pathlib import Path
 
 from config.config import load_config
 from mobileNetV3.mobileNetV3 import MobileNetV3
@@ -39,6 +41,8 @@ class LandmarksHead(tf.keras.Model):
     def __init__(self, cfg, chekpoint_path: str = "./checkpoints"):
         super(LandmarksHead, self).__init__()
         self.cfg = cfg
+        self.vis_dir = Path(cfg.TRAIN.VIS_DIR)
+        self.vis_dir.mkdir(exist_ok=True)
         self.body = MobileNetV3(
             mode=cfg.MODEL.MODE,
             num_classes=cfg.MODEL.NUM_LANDMARKS
@@ -51,7 +55,6 @@ class LandmarksHead(tf.keras.Model):
         dummy = tf.ones((1, 128, 128, 3))
         features = self.body(dummy)
         self.head(features)
-
         self.sigmas = tf.fill([cfg.TRAIN.BATCH_SIZE, cfg.MODEL.NUM_LANDMARKS], 1.0)
         self.areas = tf.fill([cfg.TRAIN.BATCH_SIZE, cfg.MODEL.NUM_LANDMARKS], 1.0)
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
@@ -70,13 +73,22 @@ class LandmarksHead(tf.keras.Model):
             epoch_losses = []
             epoch_nmes = []
             for step, (images, landmarks) in enumerate(train_dataset):
-                loss, nme, pred_landmarks, pred_heatmaps = self._train_step(images, landmarks)
+                loss, nme, pred_landmarks, pred_heatmaps, bbox_cs = self._train_step(images, landmarks)
                 epoch_losses.append(loss.numpy())
                 epoch_nmes.append(float(tf.reduce_mean(nme).numpy()))
 
                 print_step(epoch, epochs, step + 1, total_steps,
                            np.mean(epoch_losses), 'nme', np.mean(epoch_nmes),
                            time.time() - epoch_start)
+                if (epoch * step) % self.cfg.TRAIN.VIS_EVERY_N_STEPS == 0:
+                    save_path = ( self.vis_dir / f"epoch_{epoch:03d}_step_{step:05d}.png")
+                    visualize_side_by_side(
+                        images[0].numpy(),
+                        pred_landmarks[0].numpy(),
+                        pred_heatmaps[0, :, 0, :].numpy(),
+                        pred_heatmaps[0, :, 1, :].numpy(),
+                        bbox_cs[0].numpy(),save_path=save_path
+                    )
 
             epoch_loss = np.mean(epoch_losses)
             epoch_nme = np.mean(epoch_nmes)
@@ -100,12 +112,13 @@ class LandmarksHead(tf.keras.Model):
                                 )
             gt_hm = tf.stack([gt_hm_x, gt_hm_y, gt_hm_z], axis=2)
             loss_hm = compute_hm_loss(gt_hm, pred_heatmaps, images)
+
         gradients = tape.gradient(loss_hm, self.head.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.head.trainable_variables))
 
         nme = compute_nme(pred_landmarks, gt_landmarks, bbox_size=bbox_size)
 
-        return loss_hm, nme, pred_landmarks, pred_heatmaps
+        return loss_hm, nme, pred_landmarks, pred_heatmaps, bbox_cs
 
     def preprocess_data(self, images, landmarks):
         batch_size = tf.shape(images)[0]

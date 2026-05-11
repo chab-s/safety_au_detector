@@ -12,7 +12,6 @@
 *.png
 
 # Dossiers spécifiques que tu as cités
-HeatmapHead/
 config/
 lib/
 notebooks/weights/
