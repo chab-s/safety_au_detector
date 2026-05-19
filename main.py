@@ -10,20 +10,20 @@ import time
 from pathlib import Path
 
 from config.config import load_config
-from mobileNetV3.mobileNetV3 import MobileNetV3
-from HeatmapHead.head import HeatmapHead, get_aflw2k3d_dataset, generate_heatmaps, compute_hm_loss, compute_lm_loss, compute_nme
+from models.mobileNetV3 import MobileNetV3
+from models.head import HeatmapHead, get_aflw2k3d_dataset, generate_heatmaps, compute_hm_loss, compute_lm_loss, compute_nme
 
 
-def build_bbox_cs(landmarks_gt, scale=1.0):
+def build_bbox_cs(landmarks_gt, scale=1.0):  # (center_x, center_y, width, height)
     landmarks_2d = landmarks_gt[:, :, :2]
     max_xy = tf.reduce_max(landmarks_2d, axis=1)
     min_xy = tf.reduce_min(landmarks_2d, axis=1)
 
     center = (max_xy + min_xy) / 2.0
 
-    half_size = ((max_xy - min_xy) / 2.0) * scale
+    size = (max_xy - min_xy) * scale
 
-    return tf.concat([center, half_size], axis=-1)
+    return tf.concat([center, size], axis=-1)
 
 
 import matplotlib.pyplot as plt
@@ -57,7 +57,7 @@ class LandmarksHead(tf.keras.Model):
         self.head(features)
         self.sigmas = tf.fill([cfg.TRAIN.BATCH_SIZE, cfg.MODEL.NUM_LANDMARKS], 1.0)
         self.areas = tf.fill([cfg.TRAIN.BATCH_SIZE, cfg.MODEL.NUM_LANDMARKS], 1.0)
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=cfg.TRAIN.LEARNING_RATE)
         self.checkpoint_path = chekpoint_path
 
     def predict(self, images):
@@ -67,27 +67,28 @@ class LandmarksHead(tf.keras.Model):
         history = LandmarkTrainingHistory()
         start_epoch = load_latest_checkpoint(self.head, self.checkpoint_path) if resume else 0
         total_steps = len(train_dataset)
-
         for epoch in range(start_epoch, epochs):
             epoch_start = time.time()
             epoch_losses = []
             epoch_nmes = []
             for step, (images, landmarks) in enumerate(train_dataset):
-                loss, nme, pred_landmarks, pred_heatmaps, bbox_cs = self._train_step(images, landmarks)
+                loss, loss_hm, loss_lm, nme, pred_landmarks, pred_heatmaps, bbox_cs, gt_landmarks_norm = self._train_step(images, landmarks)
                 epoch_losses.append(loss.numpy())
                 epoch_nmes.append(float(tf.reduce_mean(nme).numpy()))
 
                 print_step(epoch, epochs, step + 1, total_steps,
                            np.mean(epoch_losses), 'nme', np.mean(epoch_nmes),
                            time.time() - epoch_start)
-                if (epoch * step) % self.cfg.TRAIN.VIS_EVERY_N_STEPS == 0:
+                if (epoch * step + step) % self.cfg.TRAIN.VIS_EVERY_N_STEPS == 0:
                     save_path = ( self.vis_dir / f"epoch_{epoch:03d}_step_{step:05d}.png")
                     visualize_side_by_side(
                         images[0].numpy(),
+                        gt_landmarks_norm[0].numpy(),
                         pred_landmarks[0].numpy(),
                         pred_heatmaps[0, :, 0, :].numpy(),
                         pred_heatmaps[0, :, 1, :].numpy(),
-                        bbox_cs[0].numpy(),save_path=save_path
+                        bbox_cs[0].numpy(),
+                        save_path=save_path
                     )
 
             epoch_loss = np.mean(epoch_losses)
@@ -102,29 +103,38 @@ class LandmarksHead(tf.keras.Model):
     @tf.function
     def _train_step(self, images, gt_landmarks):
         images = tf.image.resize(images, [128, 128])
+        gt_landmarks_norm, bbox_cs, bbox_size, sigmas, areas, x_bins_base, y_bins_base, z_bins_base = self.preprocess_data(
+            images, gt_landmarks)
+
+        gt_hm_x, gt_hm_y, gt_hm_z = generate_heatmaps(
+            gt_landmarks,  # ← normalisés, pas bruts
+            bbox_cs, sigmas, areas,
+            x_bins_base, y_bins_base, z_bins_base
+        )
+        gt_hm = tf.stack([gt_hm_x, gt_hm_y, gt_hm_z], axis=2)
+
         with tf.GradientTape() as tape:
             features = self.body(images, training=True)
             pred_landmarks, pred_heatmaps = self.head(features, training=True)
-            bbox_cs, bbox_size, sigmas, areas, x_bins_base, y_bins_base, z_bins_base = self.preprocess_data(images, gt_landmarks)
-            gt_hm_x, gt_hm_y, gt_hm_z = generate_heatmaps(
-                                    gt_landmarks, bbox_cs, sigmas, areas,
-                                    x_bins_base, y_bins_base, z_bins_base
-                                )
-            gt_hm = tf.stack([gt_hm_x, gt_hm_y, gt_hm_z], axis=2)
-            loss_hm = compute_hm_loss(gt_hm, pred_heatmaps, images)
 
-        gradients = tape.gradient(loss_hm, self.head.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.head.trainable_variables))
+            loss_hm = compute_hm_loss(gt_hm, pred_heatmaps)
+            loss_lm = compute_lm_loss(pred_landmarks, gt_landmarks_norm)
+            lambda_lm = tf.stop_gradient(loss_hm / (loss_lm + 1e-8))
+            loss = loss_hm + lambda_lm * loss_lm
 
-        nme = compute_nme(pred_landmarks, gt_landmarks, bbox_size=bbox_size)
+        # body + head ← les deux
+        all_vars = self.body.trainable_variables + self.head.trainable_variables
+        gradients = tape.gradient(loss, all_vars)
+        self.optimizer.apply_gradients(zip(gradients, all_vars))
 
-        return loss_hm, nme, pred_landmarks, pred_heatmaps, bbox_cs
+        nme = compute_nme(pred_landmarks, gt_landmarks_norm, bbox_size=bbox_size)
+        return loss, loss_hm, loss_lm, nme, pred_landmarks, pred_heatmaps, bbox_cs, gt_landmarks_norm
 
     def preprocess_data(self, images, landmarks):
         batch_size = tf.shape(images)[0]
         num_landmarks = tf.shape(landmarks)[1]
         bbox_cs = build_bbox_cs(landmarks, scale=1.2)
-        bbox_size = tf.reduce_mean(bbox_cs[:, 3:], axis=-1)
+        bbox_size = bbox_cs[:, 2:]
         sigmas = tf.fill([batch_size, num_landmarks], 1.0)
         areas = tf.fill([batch_size, num_landmarks], 1.0)
         # areas = tf.tile(tf.expand_dims(bbox_size, 1), [1, num_landmarks])
@@ -133,7 +143,14 @@ class LandmarksHead(tf.keras.Model):
         y_bins_base = tf.linspace(-1., 1., num_bins)
         z_bins_base = tf.linspace(0., 1.1, num_bins)
 
-        return bbox_cs, bbox_size, sigmas, areas, x_bins_base, y_bins_base, z_bins_base
+        center = bbox_cs[:, :2]
+        gt_xy_norm = (landmarks[..., :2] - center[:, None, :]) / bbox_size[:, None, :] # center & normalize
+
+        gt_z = tf.clip_by_value(landmarks[..., 2:3], 0.0, 1.1)
+
+        gt_landmarks_norm = tf.concat([gt_xy_norm, gt_z], axis=-1)
+
+        return gt_landmarks_norm, bbox_cs, bbox_size, sigmas, areas, x_bins_base, y_bins_base, z_bins_base
 
 
 if __name__ == '__main__':
