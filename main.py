@@ -127,7 +127,7 @@ class LandmarksHead(tf.keras.Model):
         gradients = tape.gradient(loss, all_vars)
         self.optimizer.apply_gradients(zip(gradients, all_vars))
 
-        nme = compute_nme(pred_landmarks, gt_landmarks_norm, bbox_size=bbox_size)
+        nme = compute_nme(pred_landmarks, gt_landmarks_norm, bbox_cs=bbox_cs, bbox_size=bbox_size)
         return loss, loss_hm, loss_lm, nme, pred_landmarks, pred_heatmaps, bbox_cs, gt_landmarks_norm
 
     def preprocess_data(self, images, landmarks):

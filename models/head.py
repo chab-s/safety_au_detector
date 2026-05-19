@@ -134,11 +134,24 @@ def compute_lm_loss(pred_lm, target_lm, w=10.0, epsilon=2.0):
     )
     return tf.reduce_mean(loss)
 
-def compute_nme(pred_landmarks, gt_landmarks, bbox_size):
+def compute_nme(pred_landmarks, gt_landmarks, bbox_cs, bbox_size):
     # pred/gt : (batch, num_lm, 2) — seulement X et Y
-    diff = tf.norm(pred_landmarks[..., :2] - gt_landmarks[..., :2], axis=-1)
-    nme = tf.reduce_mean(diff) / bbox_size
-    return nme
+    bbox_cs = tf.cast(bbox_cs, tf.float32)
+
+    cx = bbox_cs[:, 0]
+    cy = bbox_cs[:, 1]
+    w = bbox_cs[:, 2]
+    h = bbox_cs[:, 3]
+
+    gt_x = gt_landmarks[..., 0] * w[:, None] + cx[:, None]
+    gt_y = gt_landmarks[..., 1] * h[:, None] + cy[:, None]
+    pred_x = pred_landmarks[..., 0] * w[:, None] + cx[:, None]
+    pred_y = pred_landmarks[..., 1] * h[:, None] + cy[:, None]
+
+    diff = tf.sqrt((pred_x - gt_x) ** 2 + (pred_y - gt_y) ** 2)
+    bbox_size = tf.sqrt(w * h)
+
+    return tf.reduce_mean(diff / (bbox_size[:, None] + 1e-8))
 
 
 def compute_physical_loss():
