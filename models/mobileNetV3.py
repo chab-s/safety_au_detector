@@ -57,7 +57,6 @@ def _make_divisible(v, divisor, min_value=None):
         new_v += divisor
     return new_v
 
-
 class SELayer(layers.Layer):
     def __init__(self, channel, reduction=4):
         super(SELayer, self).__init__()
@@ -202,6 +201,9 @@ class MobileNetV3(layers.Layer):
         y = self.head(y, training = training)
         return y
 
+# ═════════════════════════════════════════════════════════════════════════════
+# 4. ACTIVATION
+# ═════════════════════════════════════════════════════════════════════════════
 
 def hard_swish(x):
     return x * tf.nn.relu6(x + 3.0) / 6.0
