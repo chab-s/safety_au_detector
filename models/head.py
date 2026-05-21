@@ -97,20 +97,23 @@ class LandmarksHead(tf.keras.Model):
         self.adam_optimizer = tf.keras.optimizers.Adam(learning_rate=cfg.TRAIN.LEARNING_RATE)
 
     @property
-    def sigmas(self):  # avoid negatives values
-        return tf.exp(self.log_sigma)
+    def sigmas(self):
+        return tf.exp(self.log_sigma)  # avoid negatives values
 
     @tf.function
-    def _train_step(self, images, gt_landmarks):
-        gt_landmarks_norm, bbox_cs, bbox_size, sigmas, areas, x_bins_base, y_bins_base, z_bins_base = self._preprocess_data(
+    def _train_step(self, images, gt_landmarks):  # seems pas ok.
+        x_bins_norm = tf.linspace(-1., 1., self.cfg.MODEL.NUM_BINS)
+        y_bins_norm = tf.linspace(-1., 1., self.cfg.MODEL.NUM_BINS)
+        z_bins_range = tf.linspace(0., 1.1, self.cfg.MODEL.NUM_BINS)
+        gt_lm_norm, bbox_cs, bbox_size, sigmas = self._preprocess_data(
             images, gt_landmarks)
 
         with tf.GradientTape() as tape:
             sigmas = self.sigmas
             gt_hm_x, gt_hm_y, gt_hm_z = generate_heatmaps(
-                gt_landmarks_norm,  # normalized or pixelized ???
-                bbox_cs, sigmas,
-                x_bins_base, y_bins_base, z_bins_base
+                gt_lm_norm,
+                sigmas,
+                x_bins_norm, y_bins_norm, z_bins_range
             )
             gt_hm = tf.stack([gt_hm_x, gt_hm_y, gt_hm_z], axis=2)
 
@@ -118,7 +121,7 @@ class LandmarksHead(tf.keras.Model):
             pred_heatmaps, pred_landmarks = self.head(features, training=True)
 
             loss_hm = compute_hm_loss(gt_hm, pred_heatmaps)
-            loss_lm = compute_lm_loss(pred_landmarks, gt_landmarks_norm, sigmas)
+            loss_lm = compute_lm_loss(pred_landmarks, gt_lm_norm, sigmas)
             variance = tf.square(sigmas)
             loss_lm_reg = (loss_lm / (variance + 1e-6)) + (2.0 * self.log_sigma)
             loss_lm = tf.reduce_mean(loss_lm_reg)
@@ -131,38 +134,35 @@ class LandmarksHead(tf.keras.Model):
         gradients = tape.gradient(loss, all_vars)
         self.adam_optimizer.apply_gradients(zip(gradients, all_vars))
 
-        return loss, loss_hm, loss_lm, pred_landmarks, pred_heatmaps, bbox_cs, bbox_size, gt_landmarks_norm
+        return loss, loss_hm, loss_lm, pred_landmarks, pred_heatmaps, bbox_cs, bbox_size, gt_hm
+
 
     def _preprocess_data(self, images, landmarks):  # seems ok too.
         batch_size = tf.shape(images)[0]
         num_landmarks = tf.shape(landmarks)[1]
-        # tf.debugging.assert_equal(
-        #     batch_size,
-        #     self.cfg.TRAIN.BATCH_SIZE
-        # )
-        # tf.debugging.assert_equal(
-        #     num_landmarks,
-        #     self.cfg.MODEL.NUM_LANDMARKS
-        # )
+        tf.debugging.assert_equal(
+            batch_size,
+            tf.constant(self.cfg.TRAIN.BATCH_SIZE, dtype=tf.int32),
+            message="Batch size mismatch"
+        )
+        tf.debugging.assert_equal(
+            num_landmarks,
+            tf.constant(self.cfg.MODEL.NUM_LANDMARKS, dtype=tf.int32),
+            message="Num landmarks mismatch"
+        )
 
         bbox_cs = build_bbox_cs(landmarks, scale=1.2)   # (center_x, center_y, width, height)
         bbox_size = bbox_cs[:, 2:]
 
         sigmas = tf.tile(self.sigmas[None], [batch_size, 1])  # build a sigma for each batch
-        areas = bbox_cs[:, 2] * bbox_cs[:, 3]
-        areas = tf.tile(areas[:, None], [1, num_landmarks])  # build an area for each landmarks
-
-        x_bins_base = tf.linspace(-1., 1., self.cfg.MODEL.NUM_BINS)
-        y_bins_base = tf.linspace(-1., 1., self.cfg.MODEL.NUM_BINS)
-        z_bins_base = tf.linspace(0., 1.1, self.cfg.MODEL.NUM_BINS)
 
         center = bbox_cs[:, :2]
         gt_xy_norm = (landmarks[..., :2] - center[:, None, :]) / bbox_size[:, None, :] # center & normalize between -1 & 1
         gt_z = tf.clip_by_value(landmarks[..., 2:3], 0.0, 1.1)
 
-        gt_landmarks_norm = tf.concat([gt_xy_norm, gt_z], axis=-1)
+        gt_lm_norm = tf.concat([gt_xy_norm, gt_z], axis=-1)
 
-        return gt_landmarks_norm, bbox_cs, bbox_size, sigmas, areas, x_bins_base, y_bins_base, z_bins_base
+        return gt_lm_norm, bbox_cs, bbox_size, sigmas
 
     def predict(self, images):
         pass
@@ -178,11 +178,11 @@ class LandmarksHead(tf.keras.Model):
             epoch_nmes = []
             for step, (images, landmarks) in enumerate(train_dataset):
                 images_input = tf.image.resize(images, self.cfg.MODEL.IMAGE_SIZE)
-                loss, loss_hm, loss_lm, pred_landmarks, pred_heatmaps, bbox_cs, bbox_size, gt_landmarks_norm\
+                loss, loss_hm, loss_lm, pred_landmarks, pred_heatmaps, bbox_cs, bbox_size, gt_lm_norm\
                     = self._train_step(images_input, landmarks)
                 epoch_losses.append(loss.numpy())
 
-                nme = compute_nme(pred_landmarks, gt_landmarks_norm, bbox_cs=bbox_cs)
+                nme = compute_nme(pred_landmarks, gt_lm_norm, bbox_cs=bbox_cs)
                 epoch_nmes.append(float(tf.reduce_mean(nme).numpy()))
 
                 print_step(epoch, epochs, step + 1, total_steps,
@@ -193,7 +193,7 @@ class LandmarksHead(tf.keras.Model):
                     save_path = ( self.vis_dir / f"epoch_{epoch:03d}_step_{step:05d}.png")
                     visualize_side_by_side(
                         images_input[0].numpy(),
-                        gt_landmarks_norm[0].numpy(),
+                        gt_lm_norm[0].numpy(),
                         pred_landmarks[0].numpy(),
                         pred_heatmaps[0, :, 0, :].numpy(),
                         pred_heatmaps[0, :, 1, :].numpy(),
@@ -225,9 +225,9 @@ def build_bbox_cs(landmarks_gt, scale=1.0):  # (center_x, center_y, width, heigh
 
     return tf.concat([center, size], axis=-1)
 
-def _decode_prediction(x_bins_base, y_bins_base, center, scale):
-    x_bins = x_bins_base[None, None, :] * scale[:, None, 0:1] / 2 + center[:, None, 0:1]
-    y_bins = y_bins_base[None, None, :] * scale[:, None, 1:2] / 2 + center[:, None, 1:2]
+def _decode_prediction(x_bins_norm, y_bins_norm, center, scale):
+    x_bins = x_bins_norm[None, None, :] * scale[:, None, 0:1] / 2 + center[:, None, 0:1]
+    y_bins = y_bins_norm[None, None, :] * scale[:, None, 1:2] / 2 + center[:, None, 1:2]
 
     return x_bins, y_bins
 
@@ -238,35 +238,58 @@ def decode_xy(x_hms, y_hms, z_hms, x_bins, y_bins, z_bins):
 
     return tf.stack([x, y, z], axis=-1)
 
-def generate_heatmaps(landmarks_gt, bbox_cs, sigmas, x_bins_base, y_bins_base, z_bins_base):
-    center = bbox_cs[:, :2]
-    scale = bbox_cs[:, 2:]
-
+# normalized version
+def generate_heatmaps(landmarks_gt, sigmas, x_bins_norm, y_bins_norm, z_bins_range):
     x_gt = landmarks_gt[..., 0:1]
     y_gt = landmarks_gt[..., 1:2]
     z_gt = landmarks_gt[..., 2:3]
-    z_gt = tf.clip_by_value(z_gt, 0.0, 1.1)
 
-    x_bins, y_bins = _decode_prediction(x_bins_base, y_bins_base, center, scale)
-    dist_x = tf.abs(x_gt - x_bins)
-    dist_y = tf.abs(y_gt - y_bins)
-    dist_z = tf.abs(z_gt - z_bins_base)
+    dist_x = tf.abs(x_gt - x_bins_norm)
+    dist_y = tf.abs(y_gt - y_bins_norm)
+    dist_z = tf.abs(z_gt - z_bins_range)
 
-    areas = bbox_cs[:, 2] * bbox_cs[:, 3]
-    areas = tf.tile(areas[:, None], [1, tf.shape(landmarks_gt)[1]])
-    sigmas = tf.clip_by_value(sigmas, 0.01, 0.5)  # clip values between minimum and maximum avoiding extremums
+    sigmas = tf.clip_by_value(sigmas, 0.01, 0.5)
 
-    areas = tf.sqrt(tf.maximum(areas, 1e-6))
-
-    dist_x = dist_x / areas[..., None] / sigmas[..., None]
-    dist_y = dist_y / areas[..., None] / sigmas[..., None]
-    dist_z = dist_z / areas[..., None] / sigmas[..., None]
+    dist_x = dist_x / sigmas[..., None]
+    dist_y = dist_y / sigmas[..., None]
+    dist_z = dist_z / sigmas[..., None]
 
     hm_x = tf.exp(-dist_x / 2.0) / sigmas[..., None]
     hm_y = tf.exp(-dist_y / 2.0) / sigmas[..., None]
     hm_z = tf.exp(-dist_z / 2.0) / sigmas[..., None]
 
     return hm_x, hm_y, hm_z
+
+# Unnormalized version
+# def generate_heatmaps(landmarks_gt, bbox_cs, sigmas, x_bins_norm, y_bins_norm, z_bins_range):
+#     center = bbox_cs[:, :2]
+#     scale = bbox_cs[:, 2:]
+#
+#     x_gt = landmarks_gt[..., 0:1]
+#     y_gt = landmarks_gt[..., 1:2]
+#     z_gt = landmarks_gt[..., 2:3]
+#     z_gt = tf.clip_by_value(z_gt, 0.0, 1.1)  # pas sur
+#
+#     # x_bins, y_bins = _decode_prediction(x_bins_norm, y_bins_norm, center, scale)
+#     dist_x = tf.abs(x_gt - x_bins)
+#     dist_y = tf.abs(y_gt - y_bins)
+#     dist_z = tf.abs(z_gt - z_bins_range)
+#
+#     areas = bbox_cs[:, 2] * bbox_cs[:, 3]
+#     areas = tf.tile(areas[:, None], [1, tf.shape(landmarks_gt)[1]])
+#     sigmas = tf.clip_by_value(sigmas, 0.01, 0.5)  # clip values between minimum and maximum avoiding extremums
+#
+#     areas = tf.sqrt(tf.maximum(areas, 1e-6))
+#
+#     dist_x = dist_x / areas[..., None] / sigmas[..., None]
+#     dist_y = dist_y / areas[..., None] / sigmas[..., None]
+#     dist_z = dist_z / areas[..., None] / sigmas[..., None]
+#
+#     hm_x = tf.exp(-dist_x / 2.0) / sigmas[..., None]
+#     hm_y = tf.exp(-dist_y / 2.0) / sigmas[..., None]
+#     hm_z = tf.exp(-dist_z / 2.0) / sigmas[..., None]
+#
+#     return hm_x, hm_y, hm_z
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 4. LOSS
@@ -361,6 +384,6 @@ def get_aflw2k3d_dataset(cfg):
 if __name__ == '__main__':
     conf = load_config("config/config.yaml")
     afl_dataset = get_aflw2k3d_dataset(conf)
-    train_dataset = afl_dataset.shuffle(1000).batch(32).prefetch(tf.data.AUTOTUNE)
+    train_dataset = afl_dataset.shuffle(1000).batch(conf.TRAIN.BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     model = LandmarksHead(conf)
     model.fit(train_dataset, epochs=conf.TRAIN.EPOCHS, resume=True, viz_training=False)
